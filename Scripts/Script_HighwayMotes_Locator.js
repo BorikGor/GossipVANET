@@ -1,248 +1,273 @@
-// Constants for positioning and movement
-var STATIONARY_SPACING = 500;
-var MOBILE_RECT_HEIGHT = 1;
-var MOBILE_SPACING_MIN = 0.1;
-var MOBILE_SPACING_MAX = 0.3;
-var DELTA_SPEED = 0.1;
-var SPEED_MIN = 0.2;
-var SPEED_MAX = 0.5;
-var MAX_X = 100000;
-var MAX_Y = 100;
-var DIRECTION_CHANGE_INTERVAL = 500;
-var SIMULATION_TICK_DELAY = 500;
-var VERTICAL_DISTANCE = 20;
+/* ============================================================================
+ * Cooja Simulation Script: Highway Motes — Parity-based bidirectional lanes
+ *
+ * WHAT THIS SCRIPT DOES
+ *  - Classify motes into Stationary (incl. RSU) and Mobile.
+ *  - INITIAL PLACEMENT (NEW):
+ *      * Odd-ID mobiles start at X = -MAX_X and move RIGHT (positive speed).
+ *      * Even-ID mobiles start at X = +MAX_X and move LEFT (negative speed).
+ *  - MOVEMENT:
+ *      * Continuous motion along X. When hitting +/-MAX_X, reverse direction
+ *        by flipping speed sign (bounce behavior).
+ *  - LED MONITOR (kept): If RED LED is ON, freeze the mote (auto-stop).
+ *      * EXCEPTION (NEW): Ignore RED LED if the last seen EF direction for
+ *        this mote is OPPOSITE to the mote's current travel direction
+ *        (i.e., EF is "wrong direction" for this receiver).
+ *        We use a small mailbox "efDir" populated by Serial lines printed
+ *        by firmware: "EF_DIR <id> <dir8>"
+ *        (dir8 is the discrete 8-way heading contained in EF payload).
+ *  - STOP/GO (kept):
+ *      * STOP <id>  -> hard freeze (overrides everything).
+ *      * GO   <id>  -> unfreeze + send "GO\n" to the mote's Serial and
+ *                      temporarily ignore its RED LED until LED goes OFF.
+ *  - REQ_LOC handler (kept): when a mote prints "REQ_LOC", we answer with
+ *      "LOC <id> <x_dm> <y_dm> <ts_ms>" on that mote's Serial.
+ *  - Movement tick is driven by GENERATE_MSG(..., "move_next").
+ *
+ * HOW "WRONG DIRECTION EF" IS RECOGNIZED
+ *  - Firmware should print:   EF_DIR <id> <dir8>\n
+ *    where <dir8> is the EF's direction (0..7, E,NE,N,NW,W,SW,S,SE).
+ *  - We compare <dir8> with the sign of the current X-speed:
+ *      * RIGHT-like dir (E/NE/SE) => expected positive speed.
+ *      * LEFT-like  dir (W/NW/SW) => expected negative speed.
+ *    If mismatch -> EF is "wrong direction" for this receiver: we DO NOT
+ *    auto-stop even if RED LED is on.
+ *
+ * NOTE
+ *  - If EF_DIR lines are not printed by firmware, the script cannot know
+ *    EF direction; in that case LED-monitor behaves as before.
+ * ========================================================================== */
 
-// Arrays to hold motes and their attributes
+/* -------------------------- Parameters ------------------------------------ */
+var STATIONARY_SPACING = 2000;
+var MAX_X              = 10000;    /* absolute bound along X axis */
+var MAX_Y              = 100;       /* unused for now (we keep Y=0) */
+var SIMULATION_TICK_DELAY = 500;    /* ms-equivalent (Cooja uses /10) */
+
+var SPEED_MIN = 0.2;   /* absolute magnitude lower bound */
+var SPEED_MAX = 0.5;   /* absolute magnitude upper bound */
+var DELTA_SPEED = 0.1; /* small jitter per tick */
+
+/* -------------------------- State containers ------------------------------ */
 var stationaryMotes = [];
-var mobileMotes = [];
-var moteSpeeds = [];
-var moteDirections = [];
-var moteDistances = [];
-var moteFlags = [];
+var mobileMotes     = [];
 
-// NEW: frozen map (mote ID -> true) for STOP/GO
-var frozen = {};
+/* Per-mobile state, indexed by the mobileMotes' index (not mote ID) */
+var moteSpeedAbs    = [];  /* absolute speed magnitude (>=0) */
+var moteSpeedSign   = [];  /* +1 to the right, -1 to the left */
+var moteDistance    = [];  /* distance accumulator (for optional events) */
 
-// Flags for mobile mote positions
-var POSITION_MIDDLE = "MIDDLE";
-var POSITION_UP = "UP";
-var POSITION_DOWN = "DOWN";
-var DIRECTION_TO_MIDDLE = "TO_MIDDLE";
-var FLAG_RETURNING = "RETURNING";
+/* Control maps by mote ID */
+var frozen        = {};  /* STOP-hard-freeze */
+var stoppedManual = {};  /* was stopped manually at least once */
+var ledIgnore     = {};  /* ignore RED LED after GO until LED becomes OFF */
 
-// Initialization of motes
-log.log("Initializing motes...\n");
+/* EF direction mailbox by mote ID: last EF dir8 observed for that mote */
+var efDir = {};          /* efDir[id] = dir8 (0..7) */
+
+/* Helper: classify directions into left/right groups */
+function isRightish(dir8) {
+  /* 0:E, 1:NE, 2:N, 3:NW, 4:W, 5:SW, 6:S, 7:SE (typical compass) */
+  return (dir8 === 0 || dir8 === 1 || dir8 === 7); /* E, NE, SE => rightish */
+}
+function isLeftish(dir8) {
+  return (dir8 === 4 || dir8 === 3 || dir8 === 5); /* W, NW, SW => leftish  */
+}
+
+/* -------------------------- Init: classify and place ---------------------- */
+log.log("Initializing motes (parity-based lanes)...\n");
 var motes = sim.getMotes();
-log.log("Got all the motes: " + motes.length + "\n");
+
 for (var i = 0; i < motes.length; i++) {
-  var mote = motes[i];
-  var name = mote.getType().getDescription();
-  if (name.indexOf("Static") !== -1) {
-    stationaryMotes.push(mote);
+  var m = motes[i];
+  var name = m.getType().getDescription();
+  if (name.indexOf("Stationary") !== -1 || name.indexOf("RSU") !== -1) {
+    stationaryMotes.push(m);
   } else if (name.indexOf("Mobile") !== -1) {
-    mobileMotes.push(mote);
+    mobileMotes.push(m);
   } else {
-    log.log("Error: Mote " + i + " has invalid name: " + name + "\n");
-//    sim.stopSimulation();
-//    break;
+    log.log("Warn: Unclassified mote " + m.getID() + ": " + name + "\n");
   }
 }
 
-// Position stationary motes
-for (var i = 0; i < stationaryMotes.length; i++) {
-  var mote = stationaryMotes[i];
-  var x = i * STATIONARY_SPACING;
-  var y = 0;
-  mote.getInterfaces().getPosition().setCoordinates(x, y, 0);
+/* Place stationary motes on X axis (Y=0), as before */
+for (var s = 0; s < stationaryMotes.length; s++) {
+  var sm = stationaryMotes[s];
+  var x = s * STATIONARY_SPACING;
+  sm.getInterfaces().getPosition().setCoordinates(x, 0, 0);
 }
 
-// Position mobile motes and assign attributes
-var xOffset = 0;
-for (var i = 0; i < mobileMotes.length; i++) {
-  var mote = mobileMotes[i];
-  var spacing = MOBILE_SPACING_MIN + Math.random() * (MOBILE_SPACING_MAX - MOBILE_SPACING_MIN);
-  xOffset += spacing;
-  var yOffset = Math.random() * MOBILE_RECT_HEIGHT;
-  mote.getInterfaces().getPosition().setCoordinates(xOffset, yOffset, 0);
-  // keep original behavior:
-  var speed = SPEED_MIN + Math.floor(Math.random() * (SPEED_MAX - SPEED_MIN));
-  moteSpeeds.push(speed);
-  moteDirections.push("RIGHT");
-  moteDistances.push(0);
-  moteFlags.push(POSITION_MIDDLE);
+/* NEW: parity-based initial placement and direction for mobiles */
+for (var k = 0; k < mobileMotes.length; k++) {
+  var mm = mobileMotes[k];
+  var mid = mm.getID();
+  var pos = mm.getInterfaces().getPosition();
+
+  /* odd IDs start at -MAX_X and go RIGHT; even IDs start at +MAX_X and go LEFT */
+  var startX, sign;
+  if ((mid % 2) === 1) {       /* odd */
+    startX = 0; // -MAX_X;
+    sign   = +1;
+  } else {                    /* even */
+    startX = +MAX_X;
+    sign   = -1;
+  }
+
+  /* place the mote (Y fixed at 0 for highway lane) */
+  pos.setCoordinates(startX, 0, 0);
+
+  /* absolute speed in [SPEED_MIN, SPEED_MAX], sign as above */
+  var vabs = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+  moteSpeedAbs[k]  = vabs;
+  moteSpeedSign[k] = sign;
+  moteDistance[k]  = 0;
 }
 
-// Function to schedule next movement
+/* Movement scheduler */
 function scheduleNextMove() {
   GENERATE_MSG(SIMULATION_TICK_DELAY / 10, "move_next");
 }
 scheduleNextMove();
 
+/* -------------------------- Helpers --------------------------------------- */
+/* Answer "REQ_LOC" with current X,Y in decimeters and ts in ms */
 function handleLocationRequest(mote) {
   var pos = mote.getInterfaces().getPosition();
-  var ts_ms = Math.floor(time/1000);
+  var ts_ms = Math.floor(time / 1000);
   var x = pos.getXCoordinate();
   var y = pos.getYCoordinate();
-  var id = mote.getID();
-  var response = "LOC " + id + " " + Math.round(10*x) + " " + Math.round(10*y) + " " + ts_ms;
+  var mid = mote.getID();
+  var response = "LOC " + mid + " " + Math.round(10 * x) + " "
+               + Math.round(10 * y) + " " + ts_ms;
   mote.getInterfaces().get("Serial").writeString(response + "\n");
+  //log.log("LOG: " + response + "\n");
 }
 
-// Main loop for movement
+/* Get RED LED state defensively */
+function isRedOn(mote) {
+  var leds = mote.getInterfaces().getLED ? mote.getInterfaces().getLED() : null;
+  if (!leds || !leds.isRedOn) return false;
+  try { return leds.isRedOn(); } catch (e) { return false; }
+}
+
+/* Decide if EF direction is "wrong" for current motion: 
+ *  - current motion right (sign>0) but EF says leftish  => wrong
+ *  - current motion left  (sign<0) but EF says rightish => wrong
+ * If no EF dir known for this mote, return null (unknown).
+ */
+function isWrongDirectionEF(moteId, sign) {
+  if (efDir[moteId] === undefined) return null;
+  var d = efDir[moteId] | 0;
+  if (sign > 0 && isLeftish(d))  return true;
+  if (sign < 0 && isRightish(d)) return true;
+  return false;
+}
+
+/* -------------------------- Main loop ------------------------------------- */
 while (true) {
   YIELD();
 
-  // --- Command parsing: STOP <id> / GO <id> with serial echo --------
+  /* ===================== Commands via Serial (STOP/GO/EF_DIR) ============= */
   if (typeof msg === "string") {
-    var s = ("" + msg).trim();
-    // emit echo to the sender mote (if any)
+    var s   = ("" + msg).trim();
     var src = sim.getMoteWithID(id);
 
-    // STOP <id>
+    /* STOP <id> : hard freeze */
     var mStop = s.match(/^STOP\s+(\d+)$/i);
     if (mStop) {
       var stopId = parseInt(mStop[1], 10);
-      frozen[stopId] = true;
+      frozen[stopId]        = true;
+      stoppedManual[stopId] = true;
       if (src && src.getInterfaces().get("Serial")) {
         src.getInterfaces().get("Serial").writeString("OK: STOP " + stopId + "\n");
       }
       continue;
     }
 
-    // GO <id>
+    /* GO <id> : unfreeze, send "GO\n", and temporarily ignore that mote's LED */
     var mGo = s.match(/^GO\s+(\d+)$/i);
     if (mGo) {
       var goId = parseInt(mGo[1], 10);
       delete frozen[goId];
+      if (stoppedManual[goId]) { ledIgnore[goId] = true; }
+      var tgt = sim.getMoteWithID(goId);
+      if (tgt && tgt.getInterfaces().get("Serial")) {
+        tgt.getInterfaces().get("Serial").writeString("GO\n");
+      }
       if (src && src.getInterfaces().get("Serial")) {
         src.getInterfaces().get("Serial").writeString("OK: GO " + goId + "\n");
       }
       continue;
     }
-  }
 
-  // Respond to UART request from any mote
-  if (typeof msg === "string" && msg.indexOf("REQ_LOC") >= 0) {
-    var reqMote = sim.getMoteWithID(id);
-    if (reqMote != null) {
-      handleLocationRequest(reqMote);
+    /* REQ_LOC from a mote -> answer */
+    if (s.indexOf("REQ_LOC") >= 0) {
+      var reqMote = sim.getMoteWithID(id);
+      if (reqMote) handleLocationRequest(reqMote);
+      continue;
     }
-    continue;
+
+    /* NEW: EF_DIR <id> <dir8>  (firmware hint about last EF direction) */
+    var mEf = s.match(/^EF_DIR\s+(\d+)\s+(\d+)$/i);
+    if (mEf) {
+      var mid = parseInt(mEf[1], 10);
+      var d8  = parseInt(mEf[2], 10) & 0xFF;
+      efDir[mid] = d8;
+      continue;
+    }
   }
 
-  // Tick for movement
+  /* ===================== Movement tick ==================================== */
   if (typeof msg === "string" && msg === "move_next") {
     for (var i = 0; i < mobileMotes.length; i++) {
       var mote = mobileMotes[i];
-      var pos = mote.getInterfaces().getPosition();
-      var x = pos.getXCoordinate();
-      var y = pos.getYCoordinate();
+      var mid   = mote.getID();
+      var pos  = mote.getInterfaces().getPosition();
+      var x    = pos.getXCoordinate();
 
-      // A) STOP/GO override (frozen motes do not move)
-      var moteId = mote.getID();
-      if (frozen[moteId]) {
-        moteSpeeds[i] = 0;
-        pos.setCoordinates(x, y, 0);
-        moteDistances[i] = 0;
+      /* 1) Manual hard freeze overrides everything */
+      if (frozen[mid]) {
+        pos.setCoordinates(x, 0, 0);
+        moteDistance[i] = 0;
         continue;
       }
 
-      // B) LED monitor: RED ON -> stop; RED OFF & base speed==0 -> resume with random base
-      var leds = mote.getInterfaces().getLED ? mote.getInterfaces().getLED() : null;
-      var redOn = false;
-      if (leds && leds.isRedOn) {
-        try { redOn = leds.isRedOn(); } catch (e) { redOn = false; }
-      }
-      if (redOn) {
-        moteSpeeds[i] = 0;
-        pos.setCoordinates(x, y, 0);
-        moteDistances[i] = 0;
-        continue;
-      } else {
-        if (moteSpeeds[i] === 0) {
-          moteSpeeds[i] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+      /* 2) LED-monitor with "wrong-direction EF" exception */
+      var red = isRedOn(mote);
+      if (red && !ledIgnore[mid]) {
+        var wrong = isWrongDirectionEF(mid, moteSpeedSign[i]);
+        if (wrong === true) {
+          /* EF direction conflicts with current motion => ignore LED */
+        } else {
+          /* Either wrong===false or unknown: perform legacy auto-stop */
+          moteSpeedAbs[i] = 0;
+          pos.setCoordinates(x, 0, 0);
+          moteDistance[i] = 0;
+          continue;
         }
       }
-
-      // Original speed update with jitter
-      var speed = moteSpeeds[i] + (Math.floor(Math.random() * 3) - 1)*DELTA_SPEED;
-      if (speed < SPEED_MIN) speed = SPEED_MIN;
-      if (speed > SPEED_MAX) speed = SPEED_MAX;
-
-      var direction = moteDirections[i];
-      if (direction === "RIGHT") {
-        x += speed;
-      } else if (direction === "UP") {
-        y += speed;
-        if (y <= 0) {
-          y = 0;
-          moteDirections[i] = "RIGHT";
-          moteFlags[i] = POSITION_MIDDLE;
-        }
-      } else if (direction === "DOWN") {
-        y -= speed;
-        if (y >= 0) {
-          y = 0;
-          moteDirections[i] = "RIGHT";
-          moteFlags[i] = POSITION_MIDDLE;
-        }
-      } else if (direction === DIRECTION_TO_MIDDLE) {
-        if (y > 0) {
-          y -= speed;
-          if (y <= speed) {
-            y = 0;
-            moteDirections[i] = "RIGHT";
-            moteFlags[i] = POSITION_MIDDLE;
-          }
-        } else if (y < 0) {
-          y += speed;
-          if (y >= -speed) {
-            y = 0;
-            moteDirections[i] = "RIGHT";
-            moteFlags[i] = POSITION_MIDDLE;
-          }
-        }
+      if (!red && ledIgnore[mid]) {
+        /* LED cleared -> end temporary ignore */
+        delete ledIgnore[mid];
       }
 
-      moteDistances[i] += speed;
+      /* 3) Speed jitter (on absolute value), keep sign separately */
+      var vabs = moteSpeedAbs[i] + (Math.floor(Math.random()*3)-1) * DELTA_SPEED;
+      if (vabs < SPEED_MIN) vabs = SPEED_MIN;
+      if (vabs > SPEED_MAX) vabs = SPEED_MAX;
+      moteSpeedAbs[i] = vabs;
 
-      // Enforce map boundaries
-      if (y > MAX_Y) {
-        y = MAX_Y;
-        x += speed;
-        moteDirections[i] = "RIGHT";
-        moteFlags[i] = POSITION_UP;
-      }
-      if (x < 0) x = 0;
-      if (y < -MAX_Y) {
-        y = -MAX_Y;
-        x += speed;
-        moteDirections[i] = "RIGHT";
-        moteFlags[i] = POSITION_DOWN;
-      }
+      /* 4) Advance along X per current sign */
+      var dx = vabs * moteSpeedSign[i];
+      x += dx;
+      moteDistance[i] += Math.abs(dx);
 
-      pos.setCoordinates(x, y, 0);
-    }
+      /* 5) Bounce on boundaries: reverse sign if outside limits */
+      if (x >  MAX_X) { x =  MAX_X; moteSpeedSign[i] = -1; }
+      //if (x < -MAX_X) { x = -MAX_X; moteSpeedSign[i] = +1; }
+      if (x < 0) { x = 0; moteSpeedSign[i] = +1; }
 
-    // Each mote changes direction individually after traveling enough distance
-    for (var i = 0; i < mobileMotes.length; i++) {
-      if (moteDistances[i] >= DIRECTION_CHANGE_INTERVAL) {
-        var newDirection = moteDirections[i];
-
-        if (moteFlags[i] === POSITION_MIDDLE) {
-          newDirection = Math.random() < 0.99 ? "RIGHT" : (Math.random() < 0.5 ? "UP" :"DOWN");
-        } else if (moteFlags[i] === POSITION_UP || moteFlags[i] === POSITION_DOWN) {
-          newDirection = DIRECTION_TO_MIDDLE;
-          moteFlags[i] = FLAG_RETURNING;
-        } else if (moteFlags[i] === FLAG_RETURNING) {
-          // no change until center
-        }
-
-        if (moteDirections[i] !== newDirection) {
-          moteDirections[i] = newDirection;
-          moteDistances[i] = 0;
-        }
-      }
+      pos.setCoordinates(x, 0, 0);
     }
 
     scheduleNextMove();

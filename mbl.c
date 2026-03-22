@@ -5,16 +5,30 @@
  * - Periodic 'REQ_LOC' over UART1 (Sky) and parsing 'LOC id x y ts'.
  * - Keep position (x_dm, y_dm), last timestamp, compute speed (dm/s)
  *   and discrete 8-way direction from delta.
- * - Sudden-stop detector: if |dx|+|dy| ≤ 1 dm during ≥ 2000 ms,
+ * - Sudden-stop detector: if dx+dy <= 1 dm during >= 2000 ms,
  *   declare Emergency Braking -> turn RED LED ON and send EF.
  *   When motion resumes -> send EF_FINISH (255) and turn LED OFF.
  * - Include motion metrics (x,y,v,dir) in payload of own DATA
  *   (both gossip DATA and unicast-to-RSU) and in EF/EF_FINISH.
  *
- * Existing behavior kept:
+ * Existing behavior:
  * - QUERY every WSAN_T_QUERY_MS, RSU 3-misses rule.
  * - Dedup + carry ring, flush to RSU on visibility.
  * - EF re-broadcast on receive and LED reflect remote EF code.
+ *
+ * NEW in this revision (EF-in-QUERY, multi-EF awareness):
+ * - Maintain a small local registry of active emergencies (by origin).
+ * - Put EF_flag (1B) + EF_origin_id (4B, BE) into each outgoing QUERY:
+ *   "last known" active EF; if none -> (0, 0).
+ * - Parse incoming QUERY from mobiles and update EF registry:
+ *   EF=0 -> no change; EF=255 -> remove by EF_origin_id; otherwise add.
+ * - Refresh LED from EF registry so multiple EF are handled correctly.
+ * - Fix: after local FINISH LED turns OFF (ef_led_set(0)).
+ *
+ * NEW in this patch:
+ * - ef_self_active(): guard against duplicate/self EF.
+ * - Suppress issuing local EF when we are stopped due to foreign EF.
+ * - Debug prints for EF start/finish and LOC parsing.
  */
 
 #include "contiki.h"
@@ -29,13 +43,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-
-#include "wsan_common.h"   /* WSAN_EF_FINISH, constants */
-#include "wsan_protocol.h" /* pack/parse, dedup, carry API */
+#include "wsan_common.h"     /* WSAN_EF_* constants */
+#include "wsan_protocol.h"   /* pack/parse, dedup, carry API */
 
 /* ------------ Build-time diagnostics (printf) ------------------- */
 #ifndef WSAN_DIAG
-#define WSAN_DIAG 1  /* 1=print DATA_RX/CARRY_* diagnostics */
+#define WSAN_DIAG 0 /* 1=print DATA_RX/CARRY_* diagnostics */
 #endif
 
 /* ------------ UDP connection ----------------------------------- */
@@ -50,30 +63,28 @@ static uint32_t rsu_id = 0;
 static uint8_t  have_rsu = 0;
 
 /* ------------ QUERY/ACK epochs (3-misses rule) ----------------- */
-static uint32_t probe_epoch   = 0; /* increment on each QUERY */
-static uint32_t ack_epoch_last= 0; /* epoch of last RSU/ACK   */
+static uint32_t probe_epoch    = 0; /* increment on each QUERY */
+static uint32_t ack_epoch_last = 0; /* epoch of last RSU/ACK */
 
 /* ------------ Dedup & carry store (ring) ----------------------- */
-static wsan_dedup_t  dedup;
-static wsan_carry_t  carry;
-static uint32_t      carry_evicted = 0;
+static wsan_dedup_t dedup;
+static wsan_carry_t carry;
+static uint32_t     carry_evicted = 0;
 
 /* ------------ LOC (position/time) & motion metrics ------------- */
 static uint32_t last_ts_ms = 0;
-static uint8_t  have_loc   = 0;  /* gates own DATA to RSU */
-
-static int32_t  loc_x_dm   = 0, loc_y_dm   = 0; /* current pos (dm) */
-static int32_t  prev_x_dm  = 0, prev_y_dm  = 0; /* previous pos (dm) */
-static uint8_t  have_pos   = 0;
-
-static uint32_t t_last_move_ms = 0;  /* last time we observed motion   */
-static uint16_t v_dmps          = 0; /* speed (dm/s)                    */
-static uint8_t  dir8            = 0; /* 0..7 (E,NE,N,NW,W,SW,S,SE)      */
-static uint8_t  ef_active       = 0; /* local EF state                  */
+static uint8_t  have_loc   = 0; /* gates own DATA to RSU */
+static int32_t  loc_x_dm = 0, loc_y_dm = 0; /* current pos (dm) */
+static int32_t  prev_x_dm = 0, prev_y_dm = 0; /* previous pos (dm) */
+static uint8_t  have_pos = 0;
+static uint32_t t_last_move_ms = 0; /* last time we observed motion */
+static uint16_t v_dmps = 0; /* speed (dm/s) */
+static uint8_t  dir8   = 0; /* 0..7 (E,NE,N,NW,W,SW,S,SE) */
+static uint8_t  ef_active = 0; /* legacy local EF flag (own) */
 
 /* thresholds */
-#define STOP_THRESH_DM  1      /* |dx|+|dy| <= 1 dm -> consider still */
-#define STOP_MIN_MS     2000   /* stand >= 2 s -> Emergency Braking   */
+#define STOP_THRESH_DM 1   /* dx+dy <= 1 dm -> consider still */
+#define STOP_MIN_MS    2000/* stand >= 2 s -> Emergency Braking */
 
 /* ------------ Timers ------------------------------------------- */
 static struct etimer t_query;
@@ -94,7 +105,125 @@ ef_led_set(uint8_t on)
 {
   ef_led_on = on ? 1 : 0;
   if(ef_led_on) leds_on(LEDS_RED);
-  else          leds_off(LEDS_RED);
+  else leds_off(LEDS_RED);
+}
+
+/* ================================================================
+ * NEW: EF registry (keep multiple active emergencies by origin)
+ * ----------------------------------------------------------------
+ * What:
+ *  - Maintain a small table of active EF {origin_id -> ef_code}.
+ *  - Provide add/update/remove and "last known" accessor.
+ *  - Drive LED from the registry (ON if non-empty, else OFF).
+ * Methods:
+ *  - Linear scans; tiny fixed-size table (no dynamic memory).
+ * Creates:
+ *  - ef_tab[], ef_tick monotonic counter for "last" selection.
+ */
+#define EF_TAB_MAX 8
+
+typedef struct {
+  uint8_t  in_use;     /* 1 if slot used */
+  uint32_t origin;     /* initiator OriginID */
+  uint8_t  code;       /* WSAN_EF_* (not 0, not 255) */
+  uint32_t tick;       /* updated order marker */
+} ef_entry_t;
+
+static ef_entry_t ef_tab[EF_TAB_MAX];
+static uint32_t   ef_tick = 0;
+
+/* Count active EF entries */
+static uint8_t
+ef_count_active(void)
+{
+  uint8_t n = 0;
+  for(uint8_t i = 0; i < EF_TAB_MAX; ++i) n += (ef_tab[i].in_use != 0);
+  return n;
+}
+
+/* Set LED according to registry non-emptiness (safety net) */
+static void
+ef_led_refresh(void)
+{
+  ef_led_set(ef_count_active() ? 1 : 0);
+}
+
+/* Find slot by origin */
+static int8_t
+ef_find(uint32_t origin)
+{
+  for(uint8_t i = 0; i < EF_TAB_MAX; ++i)
+    if(ef_tab[i].in_use && ef_tab[i].origin == origin) return (int8_t)i;
+  return -1;
+}
+
+/* Add new or update existing EF entry (code must be !=0 && !=255) */
+static void
+ef_add_or_update(uint32_t origin, uint8_t code)
+{
+  if(code == WSAN_EF_NONE || code == WSAN_EF_FINISH) return;
+  int8_t idx = ef_find(origin);
+  if(idx >= 0) {
+    ef_tab[idx].code = code;
+    ef_tab[idx].tick = ++ef_tick;
+    return;
+  }
+  /* insert into first free slot; if none, replace oldest */
+  int8_t free_i = -1;
+  uint32_t min_tick = 0xFFFFFFFFu;
+  int8_t   oldest_i = -1;
+  for(uint8_t i = 0; i < EF_TAB_MAX; ++i) {
+    if(!ef_tab[i].in_use && free_i < 0) free_i = (int8_t)i;
+    if(ef_tab[i].in_use && ef_tab[i].tick < min_tick) {
+      min_tick = ef_tab[i].tick; oldest_i = (int8_t)i;
+    }
+  }
+  int8_t put = (free_i >= 0) ? free_i : oldest_i;
+  ef_tab[put].in_use = 1;
+  ef_tab[put].origin = origin;
+  ef_tab[put].code   = code;
+  ef_tab[put].tick   = ++ef_tick;
+}
+
+/* Remove EF entry by origin (FINISH semantics) */
+static void
+ef_remove(uint32_t origin)
+{
+  int8_t idx = ef_find(origin);
+  if(idx >= 0) ef_tab[idx].in_use = 0;
+}
+
+/* Get "last known" EF (by tick). Returns 1 if exists, else 0. */
+static uint8_t
+ef_get_last(uint32_t *out_origin, uint8_t *out_code)
+{
+  int8_t best = -1;
+  uint32_t best_tick = 0;
+  for(uint8_t i = 0; i < EF_TAB_MAX; ++i) {
+    if(ef_tab[i].in_use && ef_tab[i].tick >= best_tick) {
+      best_tick = ef_tab[i].tick; best = (int8_t)i;
+    }
+  }
+  if(best < 0) return 0;
+  if(out_origin) *out_origin = ef_tab[best].origin;
+  if(out_code)   *out_code   = ef_tab[best].code;
+  return 1;
+}
+
+/* ================================================================
+ * NEW: Is our own EF active?
+ * ----------------------------------------------------------------
+ * What: Return 1 if there is an EF entry with origin == self.
+ * Methods: Scan ef_tab[]; compare origin_id.
+ * Creates: none.
+ */
+static uint8_t
+ef_self_active(void)
+{
+  for(uint8_t i = 0; i < EF_TAB_MAX; ++i) {
+    if(ef_tab[i].in_use && ef_tab[i].origin == origin_id) return 1;
+  }
+  return 0;
 }
 
 /* ================================================================
@@ -113,7 +242,7 @@ uart1_puts_ln(const char *s)
 }
 
 /* ================================================================
- * Helper: int hypot approximation |dx| + |dy|/2 (no sqrt).
+ * Helper: int hypot approximation dx + dy/2 (no sqrt).
  * ----------------------------------------------------------------
  * What: Fast magnitude approximation without float/sqrt.
  * Methods: integer ops only.
@@ -136,20 +265,18 @@ ihyp_dm(uint32_t adx, uint32_t ady)
 static uint8_t
 dir8_from_dxdy(int32_t dx, int32_t dy)
 {
-  /* Order (like compass, starting East and CCW): 0:E 1:NE 2:N 3:NW
-     4:W 5:SW 6:S 7:SE */
+  /* 0:E 1:NE 2:N 3:NW 4:W 5:SW 6:S 7:SE */
   int32_t ax = dx >= 0 ? dx : -dx;
   int32_t ay = dy >= 0 ? dy : -dy;
-
-  if(ax >= (ay<<1)) {             /* clearly horizontal */
-    return (dx >= 0) ? 0 : 4;     /* E or W */
-  } else if(ay >= (ax<<1)) {      /* clearly vertical   */
-    return (dy >= 0) ? 2 : 6;     /* N or S */
-  } else {                        /* diagonal-ish      */
+  if(ax >= (ay<<1)) {
+    return (dx >= 0) ? 0 : 4; /* E or W */
+  } else if(ay >= (ax<<1)) {
+    return (dy >= 0) ? 2 : 6; /* N or S */
+  } else {
     if(dx >= 0 && dy >= 0) return 1; /* NE */
-    if(dx <  0 && dy >= 0) return 3; /* NW */
-    if(dx <  0 && dy <  0) return 5; /* SW */
-    return 7;                       /* SE */
+    if(dx < 0 && dy >= 0)  return 3; /* NW */
+    if(dx < 0 && dy < 0)   return 5; /* SW */
+    return 7; /* SE */
   }
 }
 
@@ -157,19 +284,18 @@ dir8_from_dxdy(int32_t dx, int32_t dy)
  * Helper: pack metrics (x,y,v,dir) into small payload.
  * ----------------------------------------------------------------
  * Layout (7 bytes total):
- *   0..1: x_dm (int16, little-endian)
- *   2..3: y_dm (int16, little-endian)
- *   4..5: v_dmps (uint16, little-endian)
- *   6:    dir8 (0..7)
+ *  0..1: x_dm (int16, little-endian)
+ *  2..3: y_dm (int16, little-endian)
+ *  4..5: v_dmps (uint16, little-endian)
+ *  6:    dir8 (0..7)
  * Creates: 7-byte array in 'out'.
  */
 static void
 pack_metrics(uint8_t out[7])
 {
-  int16_t x = (int16_t)loc_x_dm;
-  int16_t y = (int16_t)loc_y_dm;
+  int16_t  x = (int16_t)loc_x_dm;
+  int16_t  y = (int16_t)loc_y_dm;
   uint16_t v = v_dmps;
-
   out[0] = (uint8_t)(x & 0xFF);
   out[1] = (uint8_t)((x >> 8) & 0xFF);
   out[2] = (uint8_t)(y & 0xFF);
@@ -196,7 +322,6 @@ typedef struct {
 } fanout_ctx_t;
 
 static void fanout_cb(void *ptr); /* fwd */
-
 static fanout_ctx_t ef_fanout_ctx;
 static fanout_ctx_t data_fanout_ctx;
 
@@ -248,20 +373,33 @@ send_emergency(uint8_t ef_code)
   f.msg_type  = WSAN_MSG_EMERGENCY;
   f.msg_id    = wsan_make_msgid(&seq16);
   f.target_id = WSAN_TGT_BROADCAST;
+
+  /* DEBUG: announce EF start/finish at the moment of issuing */
+  if(ef_code != WSAN_EF_FINISH) {
+    printf("Emergency Issued: id=%lu code=%u\n",
+           (unsigned long)origin_id, (unsigned)ef_code);
+  } else {
+    printf("Emergency Finished: id=%lu\n", (unsigned long)origin_id);
+  }
+
   /* payload: 'E','F','B','R', code, metrics[7] */
   uint8_t pl[5 + 7] = { 'E','F','B','R', ef_code };
   pack_metrics(&pl[5]);
-  f.payload = pl; f.payload_len = sizeof(pl);
-  f.ts_ms   = last_ts_ms;
+  f.payload     = pl;
+  f.payload_len = sizeof(pl);
+  f.ts_ms       = last_ts_ms;
 
-  uint8_t buf[WSAN_MAX_FRAME]; uint16_t out_len = 0;
+  uint8_t  buf[WSAN_MAX_FRAME];
+  uint16_t out_len = 0;
   if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
 
   start_broadcast_fanout(&ef_fanout_ctx, &udp, buf, out_len,
                          WSAN_FANOUT_EF);
+
   /* keep in carry for later RSU upload */
   if(!wsan_carry_exists(&carry, f.origin_id, f.msg_id))
     wsan_carry_put(&carry, f.origin_id, f.msg_id, buf, out_len);
+
   if(have_rsu && carry.count > 0) start_carry_flush();
 }
 
@@ -283,14 +421,19 @@ parse_loc_line(const char *line)
   const char *p = line + 3;
   while(*p == ' ') p++;
 
-  (void)strtol(p, (char**)&p, 10); while(*p == ' ') p++;   /* id */
-  int32_t xdm = (int32_t)strtol(p, (char**)&p, 10);
-  while(*p == ' ') p++;
-  int32_t ydm = (int32_t)strtol(p, (char**)&p, 10);
-  while(*p == ' ') p++;
-  uint32_t ts  = (uint32_t)strtoul(p, (char**)&p, 10);
-  printf("ts is: %d",(int)ts);
+  /* Parse: id x_dm y_dm ts_ms (space-separated) */
+  long    parsed_id = strtol(p, (char**)&p, 10); while(*p == ' ') p++;
+  int32_t xdm       = (int32_t)strtol(p, (char**)&p, 10); while(*p == ' ') p++;
+  int32_t ydm       = (int32_t)strtol(p, (char**)&p, 10); while(*p == ' ') p++;
+  uint32_t ts       = (uint32_t)strtoul(p, (char**)&p, 10);
 
+  /* DEBUG: show parsed LOC */
+  /*printf("LOC_RX: self=%lu parsed_id=%ld x=%ld y=%ld ts=%lu\n",
+         (unsigned long)origin_id, parsed_id,
+         (long)xdm, (long)ydm, (unsigned long)ts);*/
+
+  /* Update timing: use previous ts snapshot for dt_ms */
+  uint32_t prev_ts_snapshot = last_ts_ms;
   last_ts_ms = ts; have_loc = 1;
 
   if(!have_pos){
@@ -303,21 +446,22 @@ parse_loc_line(const char *line)
   }
 
   /* compute delta */
-  int32_t dx = xdm - loc_x_dm;
-  int32_t dy = ydm - loc_y_dm;
+  int32_t  dx  = xdm - loc_x_dm;
+  int32_t  dy  = ydm - loc_y_dm;
   uint32_t adx = (dx >= 0) ? (uint32_t)dx : (uint32_t)(-dx);
   uint32_t ady = (dy >= 0) ? (uint32_t)dy : (uint32_t)(-dy);
 
   prev_x_dm = loc_x_dm; prev_y_dm = loc_y_dm;
-  loc_x_dm  = xdm;       loc_y_dm = ydm;
+  loc_x_dm = xdm;       loc_y_dm = ydm;
 
   /* direction update */
   dir8 = dir8_from_dxdy(dx, dy);
 
   /* speed (dm/s) from approx magnitude over dt_ms */
-  uint32_t dt_ms = (ts >= last_ts_ms) ? (ts - last_ts_ms) : 0;
+  uint32_t dt_ms = (ts >= prev_ts_snapshot) ?
+                   (ts - prev_ts_snapshot) : 0;
   if(dt_ms == 0) dt_ms = 1;
-  uint32_t mag = ihyp_dm(adx, ady);      /* dm (approx) */
+  uint32_t mag = ihyp_dm(adx, ady); /* dm (approx) */
   v_dmps = (uint16_t)((mag * 1000U) / dt_ms);
 
   /* stop / start detector */
@@ -327,19 +471,48 @@ parse_loc_line(const char *line)
     /* moved -> reset still timer; finish EF if active */
     t_last_move_ms = ts;
     if(ef_active){
-      send_emergency(WSAN_EF_FINISH); /* 255 from wsan_common.h */
+      send_emergency(WSAN_EF_FINISH); /* 255 */
       ef_active = 0;
+      /* LED must go OFF on FINISH */
       ef_led_set(0);
+      /* also clean registry, in case own entry exists */
+      ef_remove(origin_id);
+      ef_led_refresh();
     }
   } else {
     /* still */
     if(!ef_active){
-      uint32_t stood = (ts >= t_last_move_ms) ? (ts - t_last_move_ms) : 0;
+      uint32_t stood = (ts >= t_last_move_ms) ?
+                       (ts - t_last_move_ms) : 0;
       if(stood >= STOP_MIN_MS){
-        /* declare Emergency Braking (code 1) */
-        send_emergency(1);
-        ef_active = 1;
-        ef_led_set(1);
+
+        /* First guard: if our own EF already active -> no duplicates */
+        if(ef_self_active()) {
+          /* optional debug */
+          /* printf("EF_SKIP_SELF_DUP: id=%lu\n",
+                 (unsigned long)origin_id); */
+        } else {
+          /* Second guard: if any foreign EF active -> suppress */
+          uint8_t foreign = 0;
+          for(uint8_t i = 0; i < EF_TAB_MAX; ++i) {
+            if(ef_tab[i].in_use && ef_tab[i].origin != origin_id) {
+              foreign = 1; break;
+            }
+          }
+          if(foreign) {
+            printf("EF_SUPPRESSED: id=%lu (foreign EF active)\n",
+                   (unsigned long)origin_id);
+          } else {
+            /* declare Emergency Braking (code 1) */
+            send_emergency(1);
+            ef_active = 1;
+            ef_led_set(1);
+            /* add self-origin EF into registry */
+            ef_add_or_update(origin_id, 1);
+            ef_led_refresh();
+          }
+        }
+
       }
     }
   }
@@ -374,12 +547,6 @@ carry_put_logged(uint32_t origin, uint32_t msg,
     (unsigned)carry.count);
 #endif
 }
-
-/* ================================================================
- * Broadcast fan-out (non-blocking via ctimer)
- * ----------------------------------------------------------------
- * (fns already defined above)
- */
 
 /* ================================================================
  * Unicast with retries (non-blocking via ctimer)
@@ -421,8 +588,10 @@ start_unicast_with_retries(struct simple_udp_connection *udp,
   uctx.len = len;
   memcpy(uctx.buf, frame, len);
   uctx.dest = *dest;
+
   simple_udp_sendto(uctx.udp, uctx.buf, uctx.len, &uctx.dest);
   if(retries_total <= 1) { uctx.remaining = 0; return; }
+
   uctx.remaining = (uint8_t)(retries_total - 1);
   {
     uint16_t d = wsan_rand_jitter_ms();
@@ -436,7 +605,7 @@ start_unicast_with_retries(struct simple_udp_connection *udp,
  * Build & send: QUERY (always), DATA (own), EF rebroadcast
  * ---------------------------------------------------------------- */
 
-/* -- send_query(): always broadcast WSAN/QUERY ------------------- */
+/* -- send_query(): broadcast WSAN/QUERY with EF status ----------- */
 static void
 send_query(void)
 {
@@ -446,17 +615,29 @@ send_query(void)
   f.msg_type  = WSAN_MSG_QUERY;
   f.msg_id    = wsan_make_msgid(&seq16);
   f.target_id = WSAN_TGT_BROADCAST;
-  f.payload   = NULL; f.payload_len = 0;
-  f.ts_ms     = last_ts_ms;
 
-  uint8_t buf[WSAN_MAX_FRAME];
+  /* attach EF_flag(1) + EF_origin_id(4, BE) = 5 bytes */
+  uint8_t qpl[5];
+  uint32_t ef_orig = 0; uint8_t ef_flag = 0;
+  if(!ef_get_last(&ef_orig, &ef_flag)) { ef_orig = 0; ef_flag = 0; }
+  qpl[0] = ef_flag;
+  wsan_u32_be_write(&qpl[1], ef_orig);
+
+  f.payload     = qpl;
+  f.payload_len = sizeof(qpl);
+  f.ts_ms       = last_ts_ms;
+
+  uint8_t  buf[WSAN_MAX_FRAME];
   uint16_t out_len = 0;
   if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
 
   fanout_ctx_t tmp;
   start_broadcast_fanout(&tmp, &udp, buf, out_len, 1);
+
 #if WSAN_DIAG
-  printf("%lu,QUERY\n", (unsigned long)clock_seconds());
+  printf("%lu,QUERY,ef=%u,ef_orig=%lu\n",
+         (unsigned long)clock_seconds(),
+         (unsigned)ef_flag, (unsigned long)ef_orig);
 #endif
 }
 
@@ -474,10 +655,11 @@ send_data_unicast_to_rsu(void)
   f.msg_type  = WSAN_MSG_DATA;
   f.msg_id    = wsan_make_msgid(&seq16);
   f.target_id = rsu_id;
-  f.payload   = pl; f.payload_len = sizeof(pl);
-  f.ts_ms     = last_ts_ms;
+  f.payload     = pl;
+  f.payload_len = sizeof(pl);
+  f.ts_ms       = last_ts_ms;
 
-  uint8_t buf[WSAN_MAX_FRAME];
+  uint8_t  buf[WSAN_MAX_FRAME];
   uint16_t out_len = 0;
   if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
 
@@ -540,8 +722,9 @@ start_carry_flush(void)
  * UDP RX callback
  * ----------------------------------------------------------------
  * What: Parse WSAN frames, dedup, learn RSU on ACK.
- * Always accept DATA/EF, store to carry.
- * If RSU visible and carry non-empty — start flush now.
+ *       Always accept DATA/EF, store to carry.
+ *       If RSU visible and carry non-empty — start flush now.
+ *       Parse QUERY from mobiles to track EF via payload.
  */
 static void
 udp_rx_cb(struct simple_udp_connection *c,
@@ -581,6 +764,30 @@ udp_rx_cb(struct simple_udp_connection *c,
   /* --- Only mobile frames ("Mbl") beyond this point -------------- */
   if(h.marker[0]!='M' || h.marker[1]!='b' || h.marker[2]!='l') return;
 
+  /* Parse QUERY from other mobiles to absorb EF state */
+  if(h.msg_type == WSAN_MSG_QUERY) {
+    if(pl && pl_len >= 5) {
+      uint8_t  ef_flag = pl[0];
+      uint32_t ef_orig = wsan_u32_be_read(&pl[1]);
+      if(ef_flag == WSAN_EF_NONE) {
+        /* no change */
+      } else if(ef_flag == WSAN_EF_FINISH) {
+        ef_remove(ef_orig);
+        ef_led_refresh();
+      } else {
+        ef_add_or_update(ef_orig, ef_flag);
+        ef_led_refresh();
+      }
+#if WSAN_DIAG
+      printf("%lu,QUERY_RX,from=%lu,ef=%u,ef_orig=%lu\n",
+        (unsigned long)clock_seconds(),
+        (unsigned long)h.origin_id,
+        (unsigned)ef_flag, (unsigned long)ef_orig);
+#endif
+    }
+    return;
+  }
+
   if(h.msg_type == WSAN_MSG_DATA) {
 #if WSAN_DIAG
     printf("%lu,DATA_RX,from=%lu,len=%u\n",
@@ -594,13 +801,21 @@ udp_rx_cb(struct simple_udp_connection *c,
   }
 
   if(h.msg_type == WSAN_MSG_EMERGENCY) {
-    /* EF LED reflect remote EF code */
+    /* EF LED reflect remote EF code (legacy behavior) */
     if(pl && pl_len >= 5) {
       uint8_t efc = pl[4];
       ef_led_set(efc != WSAN_EF_FINISH);
+
+      /* update EF registry to handle multiple EF correctly */
+      if(efc == WSAN_EF_FINISH) ef_remove(h.origin_id);
+      else                      ef_add_or_update(h.origin_id, efc);
+
+      /* ensure LED matches "any EF active" semantics */
+      ef_led_refresh();
     }
     if(!wsan_carry_exists(&carry, h.origin_id, h.msg_id))
       carry_put_logged(h.origin_id, h.msg_id, data, datalen);
+
     /* re-broadcast EF/Finish with fan-out */
     start_broadcast_fanout(&ef_fanout_ctx, &udp, data, datalen,
                            WSAN_FANOUT_EF);
@@ -614,7 +829,8 @@ udp_rx_cb(struct simple_udp_connection *c,
  * ----------------------------------------------------------------
  * What: Register UDP, init serial line & timers, main loop.
  * Methods: send QUERY each tick; apply 3-misses rule; flush carry
- * when RSU visible; own DATA to RSU if LOC; periodic REQ_LOC.
+ *          when RSU visible; own DATA to RSU if LOC; periodic
+ *          REQ_LOC.
  * Creates: none.
  */
 PROCESS(mobile_process, "WSAN Mobile");
@@ -688,10 +904,12 @@ PROCESS_THREAD(mobile_process, ev, data)
       f.msg_type  = WSAN_MSG_DATA;
       f.msg_id    = wsan_make_msgid(&seq16);
       f.target_id = WSAN_TGT_BROADCAST;
-      f.payload   = pl; f.payload_len = sizeof(pl);
-      f.ts_ms     = last_ts_ms;
+      f.payload     = pl;
+      f.payload_len = sizeof(pl);
+      f.ts_ms       = last_ts_ms;
 
-      uint8_t buf[WSAN_MAX_FRAME]; uint16_t out_len=0;
+      uint8_t  buf[WSAN_MAX_FRAME];
+      uint16_t out_len = 0;
       if(wsan_pack(&f, buf, sizeof(buf), &out_len)) {
         start_broadcast_fanout(&data_fanout_ctx, &udp,
                                buf, out_len, WSAN_FANOUT_DATA);
