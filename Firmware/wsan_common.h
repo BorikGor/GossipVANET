@@ -64,14 +64,14 @@
 /* ===== Direction (octants) for EF payload
  * Encoded as 1 byte 0..7: {N, NE, E, SE, S, SW, W, NW}.
  */
-#define WSAN_DIR_N   0
+#define WSAN_DIR_E   0
 #define WSAN_DIR_NE  1
-#define WSAN_DIR_E   2
-#define WSAN_DIR_SE  3
-#define WSAN_DIR_S   4
+#define WSAN_DIR_N   2
+#define WSAN_DIR_NW  3
+#define WSAN_DIR_W   4
 #define WSAN_DIR_SW  5
-#define WSAN_DIR_W   6
-#define WSAN_DIR_NW  7
+#define WSAN_DIR_S   6
+#define WSAN_DIR_SE  7
 #define WSAN_DIR_UNK 255 /* unknown / not moving */
 
 #endif /* WSAN_COMMON_H_ */

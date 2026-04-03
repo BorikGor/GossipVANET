@@ -46,9 +46,15 @@
 #include "wsan_common.h"     /* WSAN_EF_* constants */
 #include "wsan_protocol.h"   /* pack/parse, dedup, carry API */
 
-/* ------------ Build-time diagnostics (printf) ------------------- */
+/* ------------ Build-time diagnostics (printf) ------------------ */
 #ifndef WSAN_DIAG
 #define WSAN_DIAG 0 /* 1=print DATA_RX/CARRY_* diagnostics */
+#endif
+
+/* ------------ Report LOC replies in the COM port --------------- */
+
+#ifndef LOC_PRINT
+#define LOC_PRINT 0 /* 1=print location data received from script  */
 #endif
 
 /* ------------ UDP connection ----------------------------------- */
@@ -79,7 +85,7 @@ static int32_t  prev_x_dm = 0, prev_y_dm = 0; /* previous pos (dm) */
 static uint8_t  have_pos = 0;
 static uint32_t t_last_move_ms = 0; /* last time we observed motion */
 static uint16_t v_dmps = 0; /* speed (dm/s) */
-static uint8_t  dir8   = 0; /* 0..7 (E,NE,N,NW,W,SW,S,SE) */
+static uint8_t  dir8   = WSAN_DIR_UNK; /* 0..7 (E,NE,N,NW,W,SW,S,SE) */
 static uint8_t  ef_active = 0; /* legacy local EF flag (own) */
 
 /* thresholds */
@@ -103,6 +109,7 @@ static uint8_t ef_led_on = 0;
 static void
 ef_led_set(uint8_t on)
 {
+  printf("[EF RX] ACCEPTED -> LED ON\n");  //DBG
   ef_led_on = on ? 1 : 0;
   if(ef_led_on) leds_on(LEDS_RED);
   else leds_off(LEDS_RED);
@@ -256,31 +263,6 @@ ihyp_dm(uint32_t adx, uint32_t ady)
 }
 
 /* ================================================================
- * Helper: map dx,dy to 8 directions (E,NE,N,NW,W,SW,S,SE).
- * ----------------------------------------------------------------
- * What: Discrete direction index 0..7 from integer dx,dy.
- * Methods: compare magnitudes; no trig.
- * Creates: none.
- */
-static uint8_t
-dir8_from_dxdy(int32_t dx, int32_t dy)
-{
-  /* 0:E 1:NE 2:N 3:NW 4:W 5:SW 6:S 7:SE */
-  int32_t ax = dx >= 0 ? dx : -dx;
-  int32_t ay = dy >= 0 ? dy : -dy;
-  if(ax >= (ay<<1)) {
-    return (dx >= 0) ? 0 : 4; /* E or W */
-  } else if(ay >= (ax<<1)) {
-    return (dy >= 0) ? 2 : 6; /* N or S */
-  } else {
-    if(dx >= 0 && dy >= 0) return 1; /* NE */
-    if(dx < 0 && dy >= 0)  return 3; /* NW */
-    if(dx < 0 && dy < 0)   return 5; /* SW */
-    return 7; /* SE */
-  }
-}
-
-/* ================================================================
  * Helper: pack metrics (x,y,v,dir) into small payload.
  * ----------------------------------------------------------------
  * Layout (7 bytes total):
@@ -411,8 +393,7 @@ send_emergency(uint8_t ef_code)
  * Methods: integer arithmetic; Manhattan thresholds; no float.
  * Creates: updates loc_x_dm, loc_y_dm, v_dmps, dir8, ef_active.
  */
-static uint8_t
-parse_loc_line(const char *line)
+static uint8_t parse_loc_line(const char *line)
 {
   if(!line) return 0;
   while(*line == ' ') line++;
@@ -422,15 +403,21 @@ parse_loc_line(const char *line)
   while(*p == ' ') p++;
 
   /* Parse: id x_dm y_dm ts_ms (space-separated) */
+#if LOC_PRINT
   long    parsed_id = strtol(p, (char**)&p, 10); while(*p == ' ') p++;
+#else
+  (void)strtol(p, (char**)&p, 10); while(*p == ' ') p++;
+#endif
   int32_t xdm       = (int32_t)strtol(p, (char**)&p, 10); while(*p == ' ') p++;
   int32_t ydm       = (int32_t)strtol(p, (char**)&p, 10); while(*p == ' ') p++;
   uint32_t ts       = (uint32_t)strtoul(p, (char**)&p, 10);
 
   /* DEBUG: show parsed LOC */
-  /*printf("LOC_RX: self=%lu parsed_id=%ld x=%ld y=%ld ts=%lu\n",
+#if LOC_PRINT
+  printf("LOC_RX: self=%lu parsed_id=%ld x=%ld y=%ld ts=%lu\n",
          (unsigned long)origin_id, parsed_id,
-         (long)xdm, (long)ydm, (unsigned long)ts);*/
+         (long)xdm, (long)ydm, (unsigned long)ts);
+#endif
 
   /* Update timing: use previous ts snapshot for dt_ms */
   uint32_t prev_ts_snapshot = last_ts_ms;
@@ -440,7 +427,7 @@ parse_loc_line(const char *line)
     prev_x_dm = loc_x_dm = xdm;
     prev_y_dm = loc_y_dm = ydm;
     t_last_move_ms = ts;
-    v_dmps = 0; dir8 = 0;
+    v_dmps = 0; dir8 = WSAN_DIR_UNK;
     have_pos = 1;
     return 1;
   }
@@ -455,7 +442,10 @@ parse_loc_line(const char *line)
   loc_x_dm = xdm;       loc_y_dm = ydm;
 
   /* direction update */
-  dir8 = dir8_from_dxdy(dx, dy);
+  dir8 = wsan_dir_from_delta(dx, dy);
+  printf("New Direction for id=%lu: %lu\n",
+      (unsigned long)origin_id,
+      (unsigned long)dir8); // DBG
 
   /* speed (dm/s) from approx magnitude over dt_ms */
   uint32_t dt_ms = (ts >= prev_ts_snapshot) ?
@@ -769,15 +759,23 @@ udp_rx_cb(struct simple_udp_connection *c,
     if(pl && pl_len >= 5) {
       uint8_t  ef_flag = pl[0];
       uint32_t ef_orig = wsan_u32_be_read(&pl[1]);
+
       if(ef_flag == WSAN_EF_NONE) {
-        /* no change */
-      } else if(ef_flag == WSAN_EF_FINISH) {
-        ef_remove(ef_orig);
-        ef_led_refresh();
-      } else {
-        ef_add_or_update(ef_orig, ef_flag);
-        ef_led_refresh();
+          return;
       }
+
+      /* Only propagate EF that we already accepted */
+      if(ef_find(ef_orig) < 0) {
+        return;
+      }
+
+      if(ef_flag == WSAN_EF_FINISH) {
+          ef_remove(ef_orig);
+      } else {
+          ef_add_or_update(ef_orig, ef_flag);
+      }
+      ef_led_refresh();
+
 #if WSAN_DIAG
       printf("%lu,QUERY_RX,from=%lu,ef=%u,ef_orig=%lu\n",
         (unsigned long)clock_seconds(),
@@ -804,6 +802,27 @@ udp_rx_cb(struct simple_udp_connection *c,
     /* EF LED reflect remote EF code (legacy behavior) */
     if(pl && pl_len >= 5) {
       uint8_t efc = pl[4];
+      uint8_t src_dir = dir8; /* default: assume same */
+      /* Extract direction of EF issuer if metrics are present */
+      if(pl_len >= 12) {
+      	/* payload[5..11] = metrics[], metrics[6] is dir8 */
+      	printf("[EF RX] raw dir byte = 0x%02X\n", pl[5 + 6]); // DBG
+        src_dir = pl[5 + 6];
+	printf(
+	    "EF_RX: self=%lu src=%lu src_dir=%u self_dir=%u\n",
+	    (unsigned long)origin_id,
+	    (unsigned long)h.origin_id,
+	    (unsigned)src_dir,
+	    (unsigned)dir8
+	);
+      }
+
+      /* Direction equality check:
+       * ignore Emergency from different direction */
+      if(dir8 != WSAN_DIR_UNK && src_dir != dir8) {
+        return;
+      }
+
       ef_led_set(efc != WSAN_EF_FINISH);
 
       /* update EF registry to handle multiple EF correctly */
