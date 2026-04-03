@@ -109,7 +109,6 @@ static uint8_t ef_led_on = 0;
 static void
 ef_led_set(uint8_t on)
 {
-  printf("[EF RX] ACCEPTED -> LED ON\n");  //DBG
   ef_led_on = on ? 1 : 0;
   if(ef_led_on) leds_on(LEDS_RED);
   else leds_off(LEDS_RED);
@@ -443,10 +442,6 @@ static uint8_t parse_loc_line(const char *line)
 
   /* direction update */
   dir8 = wsan_dir_from_delta(dx, dy);
-  printf("New Direction for id=%lu: %lu\n",
-      (unsigned long)origin_id,
-      (unsigned long)dir8); // DBG
-
   /* speed (dm/s) from approx magnitude over dt_ms */
   uint32_t dt_ms = (ts >= prev_ts_snapshot) ?
                    (ts - prev_ts_snapshot) : 0;
@@ -632,29 +627,33 @@ send_query(void)
 }
 
 /* -- send_data_unicast_to_rsu(): own data with metrics ----------- */
+
 static void
 send_data_unicast_to_rsu(void)
 {
-  if(!have_rsu || !have_loc) return;
+    if(!have_rsu || !have_loc) return;
 
-  uint8_t pl[7]; pack_metrics(pl);
+    wsan_data_payload_t pl;
 
-  wsan_fields_t f; memset(&f, 0, sizeof(f));
-  f.marker[0]='M'; f.marker[1]='b'; f.marker[2]='l';
-  f.origin_id = origin_id;
-  f.msg_type  = WSAN_MSG_DATA;
-  f.msg_id    = wsan_make_msgid(&seq16);
-  f.target_id = rsu_id;
-  f.payload     = pl;
-  f.payload_len = sizeof(pl);
-  f.ts_ms       = last_ts_ms;
+    pack_metrics((uint8_t *)&pl);
+    pl.rssi_dbm = 0; /* RSSI placeholder */
 
-  uint8_t  buf[WSAN_MAX_FRAME];
-  uint16_t out_len = 0;
-  if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    wsan_fields_t f; memset(&f, 0, sizeof(f));
+    f.marker[0]='M'; f.marker[1]='b'; f.marker[2]='l';
+    f.origin_id = origin_id;
+    f.msg_type  = WSAN_MSG_DATA;
+    f.msg_id    = wsan_make_msgid(&seq16);
+    f.target_id = rsu_id;
+    f.payload_len = sizeof(pl);
+    f.payload   = (uint8_t *)&pl;
+    f.ts_ms     = last_ts_ms;
 
-  start_unicast_with_retries(&udp, &rsu_ip, buf, out_len,
-                             WSAN_UNICAST_RETRIES);
+    uint8_t  buf[WSAN_MAX_FRAME];
+    uint16_t out_len = 0;
+    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+
+    start_unicast_with_retries(&udp, &rsu_ip, buf, out_len,
+                               WSAN_UNICAST_RETRIES);
 }
 
 /* ================================================================
@@ -806,15 +805,7 @@ udp_rx_cb(struct simple_udp_connection *c,
       /* Extract direction of EF issuer if metrics are present */
       if(pl_len >= 12) {
       	/* payload[5..11] = metrics[], metrics[6] is dir8 */
-      	printf("[EF RX] raw dir byte = 0x%02X\n", pl[5 + 6]); // DBG
         src_dir = pl[5 + 6];
-	printf(
-	    "EF_RX: self=%lu src=%lu src_dir=%u self_dir=%u\n",
-	    (unsigned long)origin_id,
-	    (unsigned long)h.origin_id,
-	    (unsigned)src_dir,
-	    (unsigned)dir8
-	);
       }
 
       /* Direction equality check:
@@ -915,23 +906,25 @@ PROCESS_THREAD(mobile_process, ev, data)
 
     /* --- Gossip own DATA when RSU is not visible (with metrics) -- */
     if(!have_rsu && etimer_expired(&t_gossip)) {
-      uint8_t pl[7]; pack_metrics(pl);
+      wsan_data_payload_t pl;
 
+      pack_metrics((uint8_t *)&pl);
+      pl.rssi_dbm = 0; /* RSSI placeholder */
       wsan_fields_t f; memset(&f, 0, sizeof(f));
       f.marker[0]='M'; f.marker[1]='b'; f.marker[2]='l';
       f.origin_id = origin_id;
       f.msg_type  = WSAN_MSG_DATA;
       f.msg_id    = wsan_make_msgid(&seq16);
       f.target_id = WSAN_TGT_BROADCAST;
-      f.payload     = pl;
       f.payload_len = sizeof(pl);
-      f.ts_ms       = last_ts_ms;
-
+      f.payload   = (uint8_t *)&pl;
+      f.ts_ms     = last_ts_ms;
+  
       uint8_t  buf[WSAN_MAX_FRAME];
       uint16_t out_len = 0;
       if(wsan_pack(&f, buf, sizeof(buf), &out_len)) {
-        start_broadcast_fanout(&data_fanout_ctx, &udp,
-                               buf, out_len, WSAN_FANOUT_DATA);
+          start_broadcast_fanout(&data_fanout_ctx, &udp,
+                                  buf, out_len, WSAN_FANOUT_DATA);
       }
       etimer_reset(&t_gossip);
     }

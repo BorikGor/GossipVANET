@@ -3,9 +3,8 @@
  * - On QUERY/DATA/EMERGENCY from Mobile: ACK (unicast), EF rebroadcast once.
  * - RSU does NOT create/finish emergencies.
  * - Dedup by (OriginID,MsgID).
- *
- * NEW: serial-line is bound to UART0, echo with printf (UART0).
- * Type "STOP 3"/"GO 3" in RSU Serial port -> RSU prints the same line.
+ * - serial-line is bound to UART0, echo with printf (UART0).
+ * - Type "STOP 3"/"GO 3" in RSU Serial port -> RSU prints the same line.
  */
 
 #include "contiki.h"
@@ -21,11 +20,42 @@
 #include "wsan_common.h"
 #include "wsan_protocol.h"
 
+/* ---------- Metric logging control ---------- */
+#ifndef WSAN_METRIC_LOG_ENABLED
+#define WSAN_METRIC_LOG_ENABLED 1
+#endif
+/* -------------------------------------------- */
+
 static struct simple_udp_connection udp;
 static uint8_t  node_id8;
 static uint32_t origin_id;   /* RSU OriginID */
 static uint16_t seq16 = 0;
 static wsan_dedup_t dedup;
+
+/* ---------- METRIC: mote output logging ---------- */
+#if WSAN_METRIC_LOG_ENABLED
+static void
+rsu_log_location(uint32_t mote_id,
+                 int32_t x_dm,
+                 int32_t y_dm,
+                 uint32_t ts_ms)
+{
+    uint32_t s = clock_time() / CLOCK_SECOND;
+    printf(
+        "[%02lu:%02lu:%02lu] [Coord%lu] [SENSOR] "
+        "mote=%lu data=x_dm=%ld y_dm=%ld ts_ms=%lu rssi=0\n",
+        s / 3600,
+        (s % 3600) / 60,
+        s % 60,
+        (unsigned long)origin_id,
+        (unsigned long)mote_id,
+        (long)x_dm,
+        (long)y_dm,
+        (unsigned long)ts_ms
+    );
+}
+#endif
+/* ------------------------------------------------ */
 
 /* ---------- Fan-out (EF) ---------- */
 typedef struct {
@@ -123,10 +153,41 @@ static void udp_rx_cb(struct simple_udp_connection *c,
   }
   if(h.msg_type == WSAN_MSG_DATA) {
     send_ack_to(sender_addr, h.origin_id, h.ts_ms);
+    
+#if WSAN_METRIC_LOG_ENABLED
+        /* DATA contains x_dm,y_dm at payload[0..7] */
+        printf("RSU logging 1:\n");
+        if(pl && pl_len >= sizeof(wsan_data_payload_t)) {
+            const wsan_data_payload_t *d =
+                (const wsan_data_payload_t *)pl;
+
+            rsu_log_location(h.origin_id,
+                             d->x_dm,
+                             d->y_dm,
+                             h.ts_ms,
+                             d->rssi_dbm);
+        }
+#endif
+
     return;
   }
   if(h.msg_type == WSAN_MSG_EMERGENCY) {
     send_ack_to(sender_addr, h.origin_id, h.ts_ms);
+#if WSAN_METRIC_LOG_ENABLED
+        printf("RSU logging 2:\n");
+        if(pl && pl_len >= 
+sizeof(wsan_emergency_payload_t)) {
+        const wsan_emergency_payload_t *e =
+            (const wsan_emergency_payload_t *)pl;
+
+        rsu_log_location(h.origin_id,
+                         e->x_dm,
+                         e->y_dm,
+                         h.ts_ms,
+                         e->rssi_dbm);
+    }
+#endif
+
     rsu_start_fanout(&rsu_ef_ctx, data, datalen, WSAN_FANOUT_EF);
     return;
   }
