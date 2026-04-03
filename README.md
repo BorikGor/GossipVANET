@@ -61,8 +61,6 @@ All protocols are tested under identical mobility and network conditions.
 ## Project Structure
 ```text
 /firmware        Embedded firmware (mobile nodes, RSUs)
-/simulation      Cooja simulation files
 /scripts         Cooja scripts and automation
-/results         Experimental results and logs
 /docs            Project proposal and report drafts
 README.md
